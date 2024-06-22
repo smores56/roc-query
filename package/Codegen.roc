@@ -8,48 +8,6 @@ import Schema exposing [
     NullableDataType,
 ]
 
-# queryLoggedIn : {} -> QueryField _ Bool _
-# queryLoggedIn = \{} -> {
-#     name: "loggedIn",
-#     params: [],
-#     resolver: \{ loggedIn } -> Ok loggedIn,
-# }
-
-# queryUser : {} -> QueryObjectField _ _ _ { userId : I64 }a
-# queryUser = \{} -> {
-#     name: "user",
-#     params: [{ name: "userId", typeName: "Int!", encoder: \x -> x }],
-#     resolver: \{ user } -> Ok user,
-#     fields: testUserObject,
-# }
-
-# testUserObject : {}
-#     -> {
-#         name : {} -> QueryField _ Str _,
-#         age : {} -> QueryField _ I64 _,
-#         address : {} -> QueryObjectField _ _ _ { primary : Bool }a,
-#     }
-# testUserObject = \{} -> {
-#     name: \{} -> {
-#         name: "name",
-#         params: [],
-#         resolver: \{ name } -> Ok name,
-#     },
-#     age: \{} -> {
-#         name: "age",
-#         params: [],
-#         resolver: \{ age } -> Ok age,
-#     },
-#     address: \{} -> {
-#         name: "address",
-#         params: [
-#             { name: "primary", typeName: "Bool!", encoder: \x -> x },
-#         ],
-#         resolver: \{ address } -> Ok address,
-#         fields: testAddressObject,
-#     },
-# }
-
 renderNullableGqlType : NullableDataType -> Str
 renderNullableGqlType = \nullableDataType ->
     when nullableDataType is
@@ -87,6 +45,13 @@ renderRocType = \dataType ->
         # TODO: handle these?
         CustomScalar _innerType -> "_"
 
+getNameOfObjectFromType : NullableDataType -> Result Str [NotAnObject]
+getNameOfObjectFromType = \nullableDataType ->
+    when nullableDataType is
+        Nullable (Object objectName) | NotNull (Object objectName) -> Ok objectName
+        Nullable (List listType) | NotNull (List listType) -> getNameOfObjectFromType listType
+        _ -> Err NotAnObject
+
 generateModule : { schema : Schema } -> Str
 generateModule = \{ schema } ->
     [renderModuleHeader schema]
@@ -109,8 +74,24 @@ renderModuleHeader = \schema ->
     |> List.concat [
         "]",
         "",
-        "import Query.Base exposing [QueryField, QueryObjectField]",
+        "import json.Option exposing [Option]",
+        "import rq.Query.Base exposing [QueryField, QueryObjectField]",
     ]
+
+renderParamsBlock : List SchemaFieldParameter -> List Str
+renderParamsBlock = \params ->
+    if List.isEmpty params then
+        ["params: [],"]
+    else
+        paramLines =
+            List.map params \param ->
+                param
+                |> renderParamLine
+                |> indentTimes 1
+
+        ["params: ["]
+        |> List.concat paramLines
+        |> List.append "],"
 
 renderParamLine : SchemaFieldParameter -> Str
 renderParamLine = \{ name, type } ->
@@ -119,87 +100,95 @@ renderParamLine = \{ name, type } ->
 
 renderParamsType : List SchemaFieldParameter -> Str
 renderParamsType = \params ->
-    paramTypes =
-        params
-        |> List.map \{ name, type } -> "$(name) : $(renderNullableRocType type)"
-        |> Str.joinWith ", "
+    if List.isEmpty params then
+        "{}a"
+    else
+        paramTypes =
+            params
+            |> List.map \{ name, type } -> "$(name) : $(renderNullableRocType type)"
+            |> Str.joinWith ", "
 
-    "{$(paramTypes)}a"
+        "{ $(paramTypes) }a"
 
 queryRootFieldName : SchemaObjectField -> Str
 queryRootFieldName = \{ name } -> "query$(capitalize name)"
 
-renderQueryRootFieldBlock : SchemaObjectField -> List Str
-renderQueryRootFieldBlock = \field ->
-    blockName = queryRootFieldName field
-    rocTypeName = renderNullableRocType field.type
+objectFieldName : Str -> Str
+objectFieldName = \objectName ->
+    "$(decapitalize objectName)Object"
 
-    (typeDefinitionLine, objectFieldsBlock) =
-        when field.type is
-            Nullable (Object objectName) | NotNull (Object objectName) ->
-                objectFieldName = "$(decapitalize objectName)Object"
-                paramsType = field |> .parameters |> renderParamsType
-                (
-                    "$(blockName) : {} -> QueryObjectField _ _ _ $(paramsType)",
-                    ["    fields: $(objectFieldName),"],
-                )
+renderFieldTypeDefinition : SchemaObjectField -> Str
+renderFieldTypeDefinition = \field ->
+    when getNameOfObjectFromType field.type is
+        Ok _objectName ->
+            paramsType = field.parameters |> renderParamsType
+            "{} -> QueryObjectField _ _ _ $(paramsType)"
 
-            _ ->
-                ("$(blockName) : {} -> QueryField _ $(rocTypeName)", [])
+        Err NotAnObject ->
+            rocTypeName = renderNullableRocType field.type
+            "{} -> QueryField _ $(rocTypeName) _"
+
+renderFieldBlock : { field : SchemaObjectField, level : [Root, Child] } -> List Str
+renderFieldBlock = \{ field, level } ->
+    fieldDefinitionLines =
+        when level is
+            Child -> ["$(field.name): \\{} -> {"]
+            Root ->
+                objectName = queryRootFieldName field
+                [
+                    "$(objectName) : $(renderFieldTypeDefinition field)",
+                    "$(objectName) = \\{} -> {",
+                ]
+
+    objectFieldsBlock =
+        when getNameOfObjectFromType field.type is
+            Ok objectName -> ["    fields: $(objectFieldName objectName),"]
+            Err NotAnObject -> []
 
     paramsBlock =
-        if List.isEmpty field.parameters then
-            ["    params: [],"]
-        else
-            paramLines =
-                List.map field.parameters \param ->
-                    param
-                    |> renderParamLine
-                    |> indentTimes 2
+        renderParamsBlock field.parameters
+        |> List.map \line ->
+            indentTimes line 1
 
-            ["    params: ["]
-            |> List.concat paramLines
-            |> List.append "    ],"
-
-    [
-        typeDefinitionLine,
-        "$(blockName) = \\{} -> {",
-        "    name: \"$(field |> .name)\"",
-    ]
+    fieldDefinitionLines
+    |> List.append "    name: \"$(field |> .name)\","
     |> List.concat paramsBlock
     |> List.append "    resolver: \\{ $(field |> .name) } -> Ok $(field |> .name),"
     |> List.concat objectFieldsBlock
-    |> List.append "}"
+    |> List.append "}$(if level == Root then "" else ",")"
+    |> List.map \line ->
+        indentAmount = if level == Child then 1 else 0
+        indentTimes line indentAmount
 
-# testUserObject : {}
-#     -> {
-#         name : {} -> QueryField _ Str _,
-#         address : {} -> QueryObjectField _ _ _ { primary : Bool }a,
-#     }
-# testUserObject = \{} -> {
-#     name: \{} -> {
-#         name: "name",
-#         params: [],
-#         resolver: \{ name } -> Ok name,
-#     },
-#     address: \{} -> {
-#         name: "address",
-#         params: [
-#             { name: "primary", typeName: "Bool!", encoder: \x -> x },
-#         ],
-#         resolver: \{ address } -> Ok address,
-#         fields: testAddressObject,
-#     },
-# }
+renderQueryRootFieldBlock : SchemaObjectField -> List Str
+renderQueryRootFieldBlock = \field -> renderFieldBlock { field, level: Root }
+
+renderOutputObjectFieldBlock : SchemaObjectField -> List Str
+renderOutputObjectFieldBlock = \field -> renderFieldBlock { field, level: Child }
+
 renderOutputObjectBlock : SchemaOutputObject -> List Str
-renderOutputObjectBlock = \{ name, fields: _ } ->
-    objectName = "$(decapitalize name)Object"
-    header = [
-        "$(objectName) : {}",
-        "    -> {",
-    ]
+renderOutputObjectBlock = \{ name, fields } ->
+    objectName = objectFieldName name
+    header =
+        [
+            "$(objectName) : {}",
+            "    -> {",
+        ]
+        |> List.concat
+            (
+                fields
+                |> List.map \field -> "$(field.name) : $(renderFieldTypeDefinition field),"
+                |> List.map \line -> indentTimes line 2
+            )
+        |> List.concat [
+            "    }",
+            "$(objectName) = \\{} -> {",
+        ]
 
-    []
+    [header]
+    |> List.concat (fields |> List.map renderOutputObjectFieldBlock)
+    |> List.append ["}"]
+    |> List.join
 
 capitalize = \text ->
     chars = Str.toUtf8 text
@@ -238,17 +227,34 @@ indentTimes = \text, amount ->
     "$(Str.repeat indent amount)$(text)"
 
 expect
+    schema : Schema
     schema = {
         customScalars: [],
         enums: [],
         unions: [],
         inputObjects: [],
-        outputObjects: [],
+        outputObjects: [
+            {
+                name: "User",
+                annotations: [],
+                fields: [
+                    { name: "name", description: "", parameters: [], type: NotNull String },
+                ],
+            },
+        ],
         queryRoot: {
             name: "Query",
             annotations: [],
             fields: [
                 { name: "loggedIn", description: "", parameters: [], type: NotNull Boolean },
+                {
+                    name: "user",
+                    description: "",
+                    parameters: [
+                        { name: "userId", description: "", type: NotNull Int, default: Err NoDefault },
+                    ],
+                    type: NotNull (List (NotNull (Object "User"))),
+                },
             ],
         },
         mutationRoot: {

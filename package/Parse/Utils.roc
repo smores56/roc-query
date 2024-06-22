@@ -13,6 +13,7 @@ module [
     isNonZeroDigit,
     isDigit,
     isWhitespace,
+    fromUtf8Unchecked,
     InvalidLowerCamelCaseWord,
     InvalidUpperCamelCaseWord,
     InvalidScreamingSnakeCaseWord,
@@ -41,10 +42,8 @@ removePrefix = \text, prefix ->
         Ok { before: "", after } -> Ok after
         _otherwise -> Err PrefixNotPresent
 
-parseLowerCamelCaseWord : Str -> Result (Str, Str) InvalidLowerCamelCaseWord
-parseLowerCamelCaseWord = \text ->
-    chars = Str.toUtf8 text
-
+parseLowerCamelCaseWord : List U8 -> Result (Str, List U8) InvalidLowerCamelCaseWord
+parseLowerCamelCaseWord = \chars ->
     walkRes =
         List.walkUntil chars (Ok (GetFirstChar, 0)) \stateRes, char ->
             when stateRes is
@@ -78,15 +77,11 @@ parseLowerCamelCaseWord = \text ->
                             |> Str.fromUtf8
                             |> Result.withDefault "",
                             chars
-                            |> List.dropFirst charCount
-                            |> Str.fromUtf8
-                            |> Result.withDefault "",
+                            |> List.dropFirst charCount,
                         )
 
-parseUpperCamelCaseWord : Str -> Result (Str, Str) InvalidUpperCamelCaseWord
-parseUpperCamelCaseWord = \text ->
-    chars = Str.toUtf8 text
-
+parseUpperCamelCaseWord : List U8 -> Result (Str, List U8) InvalidUpperCamelCaseWord
+parseUpperCamelCaseWord = \chars ->
     walkRes =
         List.walkUntil chars (Ok (GetFirstChar, 0)) \stateRes, char ->
             when stateRes is
@@ -120,15 +115,11 @@ parseUpperCamelCaseWord = \text ->
                             |> Str.fromUtf8
                             |> Result.withDefault "",
                             chars
-                            |> List.dropFirst charCount
-                            |> Str.fromUtf8
-                            |> Result.withDefault "",
+                            |> List.dropFirst charCount,
                         )
 
-parseScreamingSnakeCaseWord : Str -> Result (Str, Str) InvalidScreamingSnakeCaseWord
-parseScreamingSnakeCaseWord = \text ->
-    chars = Str.toUtf8 text
-
+parseScreamingSnakeCaseWord : List U8 -> Result (Str, List U8) InvalidScreamingSnakeCaseWord
+parseScreamingSnakeCaseWord = \chars ->
     walkRes =
         List.walkUntil chars (Ok (GetFirstChar, 0)) \stateRes, char ->
             when stateRes is
@@ -173,9 +164,7 @@ parseScreamingSnakeCaseWord = \text ->
                             |> Str.fromUtf8
                             |> Result.withDefault "",
                             chars
-                            |> List.dropFirst charCount
-                            |> Str.fromUtf8
-                            |> Result.withDefault "",
+                            |> List.dropFirst charCount,
                         )
 
 isLetter = \char ->
@@ -233,3 +222,9 @@ dropCharsWhile = \chars, shouldDropChar ->
 
     chars
     |> List.dropFirst numberOfCharsToDrop
+
+fromUtf8Unchecked : List U8 -> Str
+fromUtf8Unchecked = \bytes ->
+    when Str.fromUtf8 bytes is
+        Ok str -> str
+        Err _ -> crash "invalid UTF-8 encountered"

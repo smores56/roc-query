@@ -11,17 +11,23 @@ module [
 import Schema exposing [
     Schema,
     SchemaUnion,
-    DataType,
+    CustomScalar,
+    SchemaEnum,
+    # DataType,
     NullableDataType,
+    SchemaInputObject,
+    SchemaOutputObject,
+    SchemaObjectField,
+    SchemaFieldParameter,
 ]
 import Parse.Utils exposing [
-    removePrefix,
     parseLowerCamelCaseWord,
     parseUpperCamelCaseWord,
     parseScreamingSnakeCaseWord,
     dropCharsWhile,
     isWhitespace,
-    InvalidLowerCamelCaseWord,
+    parseByte,
+    fromUtf8Unchecked,
     InvalidUpperCamelCaseWord,
     InvalidScreamingSnakeCaseWord,
 ]
@@ -63,10 +69,27 @@ ParseEnumError : [
     InvalidName Str,
     InvalidTextAfterName Str,
     InvalidEnumVariantName InvalidScreamingSnakeCaseWord,
+    UnexpectedSuffix Str,
+]
+
+PartialSchema : {
+    customScalars : List CustomScalar,
+    enums : List SchemaEnum,
+    unions : List SchemaUnion,
+    inputObjects : List SchemaInputObject,
+    outputObjects : List SchemaOutputObject,
+}
+
+ParseSchemaAction : [
+    ParseEnum Str (List Str),
+    ParseInputObject Str (List SchemaFieldParameter),
+    ParseOutputObject Str (List SchemaObjectField),
+    SearchForEntity,
 ]
 
 parseSchema : List Str -> Result Schema _
 parseSchema = \rows ->
+    emptySchema : PartialSchema
     emptySchema = {
         customScalars: [],
         enums: [],
@@ -78,21 +101,24 @@ parseSchema = \rows ->
 
     (resultSchema, resultAction) =
         rows
-        |> List.walkWithIndexUntil (emptySchema, startingAction) \(schema, action), row, rowNumber ->
-            trimmedRow = Str.trimStart row
-            when rowParserRenameThis schema action trimmedRow is
-                Ok (nextSchema, nextAction) ->
-                    Continue (nextSchema, nextAction)
+        |> List.walkWithIndexUntil (emptySchema, Ok startingAction) \(schema, actionResult), row, rowNumber ->
+            when actionResult is
+                Err err -> Break (schema, Err err)
+                Ok action ->
+                    trimmedRow = Str.trimStart row
+                    when rowParserRenameThis schema action trimmedRow is
+                        Ok (nextSchema, nextAction) ->
+                            Continue (nextSchema, Ok nextAction)
 
-                Err error ->
-                    Break (schema, FailedToParse { row, rowNumber, error })
+                        Err error ->
+                            Break (schema, Err { row, rowNumber, error })
 
     when resultAction is
-        FailedToParse context -> Err (LineErr context)
-        ParseEnum name _variants -> Err (UnfinishedEnum name)
-        ParseInputObject name fields -> Err (UnfinishedInputObject name)
-        ParseOutputObject name _fields -> Err (UnfinishedOutputObject name)
-        SearchForEntity ->
+        Err context -> Err (RowIssue context)
+        Ok (ParseEnum name _variants) -> Err (UnfinishedEnum name)
+        Ok (ParseInputObject name _fields) -> Err (UnfinishedInputObject name)
+        Ok (ParseOutputObject name _fields) -> Err (UnfinishedOutputObject name)
+        Ok SearchForEntity ->
             queryRoot <- resultSchema.outputObjects
                 |> List.findFirst \object -> object.name == "Query"
                 |> Result.mapErr \NotFound -> QueryRootNotProvided
@@ -108,16 +134,32 @@ parseSchema = \rows ->
                 inputObjects: resultSchema.inputObjects,
                 outputObjects: resultSchema.outputObjects,
                 customScalars: resultSchema.customScalars,
-                query: queryRoot,
-                mutation: mutationRoot,
+                queryRoot,
+                mutationRoot,
+                subscriptionRoot: {
+                    name: "Subscription",
+                    annotations: [],
+                    fields: [],
+                },
             }
 
+rowParserRenameThis : PartialSchema, ParseSchemaAction, Str -> Result (PartialSchema, ParseSchemaAction) _
 rowParserRenameThis = \schema, action, row ->
     when action is
-        SearchForEntity -> searchForEntityStart schema row
-        ParseInputObject name fields -> parseInputObjectFieldRow schema name fields row
-        ParseOutputObject name fields -> parseOutputObjectFieldRow schema name fields row
-        ParseEnum name fields -> parseEnumVariantRow schema name fields row
+        SearchForEntity ->
+            searchForEntityStart schema row
+
+        ParseInputObject name fields ->
+            parseInputObjectFieldRow { schema, name, fields, row }
+            |> Result.mapErr FailedToParseInputObject
+
+        ParseOutputObject name fields ->
+            parseOutputObjectFieldRow { schema, name, fields, row }
+            |> Result.mapErr FailedToParseOutputObject
+
+        ParseEnum name variants ->
+            parseEnumVariantRow { schema, name, variants, row }
+            |> Result.mapErr FailedToParseEnum
 
 searchForEntityStart = \schema, row ->
     if Str.isEmpty row then
@@ -131,77 +173,55 @@ searchForEntityStart = \schema, row ->
                 Ok (schemaWithUnion, SearchForEntity)
 
             Ok { before: "input", after } ->
-                objectName <- parseInputObjectNameFromFirstRow after
+                objectName <- parseEntityNameFromFirstRow after
                     |> Result.try
                 Ok (schema, ParseInputObject objectName [])
 
             Ok { before: "type", after } ->
-                objectName <- parseOutputObjectNameFromFirstRow after
+                objectName <- parseEntityNameFromFirstRow after
                     |> Result.try
                 Ok (schema, ParseOutputObject objectName [])
 
             Ok { before: "enum", after } ->
-                enumName <- parseEnumNameFromFirstRow after
+                enumName <- parseEntityNameFromFirstRow after
                     |> Result.try
                 Ok (schema, ParseEnum enumName [])
 
             _otherwise -> Err NoEntityFound
 
-parseInputObjectNameFromFirstRow = \firstRow ->
-    # TODO: error out if "type" isn't followed by space(s)
-    trimmedRow = Str.trimStart firstRow
-    (objectName, afterObjectName) <- parseUpperCamelCaseWord trimmedRow
+parseEntityNameFromFirstRow = \restOfFirstRow ->
+    trimmedRow = Str.trimStart restOfFirstRow
+    (entityName, afterEntityName) <- parseUpperCamelCaseWord (Str.toUtf8 trimmedRow)
         |> Result.mapErr InvalidName
         |> Result.try
 
-    if Str.trim afterObjectName == "{" then
-        Ok objectName
+    if dropCharsWhile afterEntityName isWhitespace == ['{'] then
+        Ok entityName
     else
-        Err (InvalidTextAfterName afterObjectName)
+        Err (InvalidTextAfterName afterEntityName)
 
-parseOutputObjectNameFromFirstRow = \firstRow ->
-    trimmedRow = Str.trimStart firstRow
-    (objectName, afterObjectName) <- parseUpperCamelCaseWord trimmedRow
-        |> Result.mapErr InvalidName
-        |> Result.try
-
-    if Str.trim afterObjectName == "{" then
-        Ok objectName
-    else
-        Err (InvalidTextAfterName afterObjectName)
-
-parseEnumNameFromFirstRow = \firstRow ->
-    trimmedRow = Str.trimStart firstRow
-    (enumName, afterEnumName) <- parseUpperCamelCaseWord trimmedRow
-        |> Result.mapErr InvalidName
-        |> Result.try
-
-    if Str.trim afterEnumName == "{" then
-        Ok enumName
-    else
-        Err (InvalidTextAfterName afterEnumName)
-
-parseInputObjectFieldRow = \schema, name, fields, row ->
+parseInputObjectFieldRow : _ -> Result (PartialSchema, ParseSchemaAction) _
+parseInputObjectFieldRow = \{ schema, name, fields, row } ->
     if Str.isEmpty row then
         Ok (schema, ParseInputObject name fields)
     else if row |> Str.startsWith "}" then
-        inputObject = { name, fields }
+        inputObject = { name, fields, annotations: [] }
         Ok (
             { schema & inputObjects: List.append schema.inputObjects inputObject },
             SearchForEntity,
         )
     else
-        (fieldName, afterFieldName) <- parseLowerCamelCaseWord row
+        (fieldName, afterFieldName) <- parseLowerCamelCaseWord (Str.toUtf8 row)
             |> Result.mapErr InvalidFieldName
             |> Result.try
-        afterFieldTrimmed = Str.trimStart afterFieldName
+        afterFieldTrimmed = dropCharsWhile afterFieldName isWhitespace
 
-        afterColon <- removePrefix afterFieldTrimmed ":"
-            |> Result.mapErr \PrefixNotPresent -> ColonIsMissingFromRow
+        afterColon <- parseByte afterFieldTrimmed ':'
+            |> Result.mapErr \ByteNotFound -> ColonIsMissingFromRow
             |> Result.try
-        afterColonTrimmed = Str.trimStart afterColon
+        afterColonTrimmed = dropCharsWhile afterColon isWhitespace
 
-        (dataType, afterDataType) <- parseDataType (Str.toUtf8 afterColonTrimmed)
+        (dataType, afterDataType) <- parseDataType afterColonTrimmed
             |> Result.mapErr InvalidDataType
             |> Result.try
 
@@ -209,6 +229,8 @@ parseInputObjectFieldRow = \schema, name, fields, row ->
             objectField = {
                 name: fieldName,
                 description: "",
+                # TODO: parse
+                default: Err NoDefault,
                 type: dataType,
             }
 
@@ -219,25 +241,26 @@ parseInputObjectFieldRow = \schema, name, fields, row ->
         else
             Err X
 
-parseOutputObjectFieldRow = \schema, name, fields, row ->
+parseOutputObjectFieldRow : _ -> Result (PartialSchema, ParseSchemaAction) _
+parseOutputObjectFieldRow = \{ schema, name, fields, row } ->
     if row |> Str.startsWith "}" then
-        outputObject = { name, fields }
+        outputObject = { name, fields, annotations: [] }
         Ok (
             { schema & outputObjects: List.append schema.outputObjects outputObject },
             SearchForEntity,
         )
     else
-        (fieldName, afterFieldName) <- parseLowerCamelCaseWord row
+        (fieldName, afterFieldName) <- parseLowerCamelCaseWord (Str.toUtf8 row)
             |> Result.mapErr InvalidFieldName
             |> Result.try
-        afterFieldTrimmed = Str.trimStart afterFieldName
+        afterFieldTrimmed = dropCharsWhile afterFieldName isWhitespace
 
-        afterColon <- removePrefix afterFieldTrimmed ":"
-            |> Result.mapErr \PrefixNotPresent -> ColonIsMissingFromRow
+        afterColon <- parseByte afterFieldTrimmed ':'
+            |> Result.mapErr \ByteNotFound -> ColonIsMissingFromRow
             |> Result.try
-        afterColonTrimmed = Str.trimStart afterColon
+        afterColonTrimmed = dropCharsWhile afterColon isWhitespace
 
-        (dataType, afterDataType) <- parseDataType (Str.toUtf8 afterColonTrimmed)
+        (dataType, afterDataType) <- parseDataType afterColonTrimmed
             |> Result.mapErr InvalidDataType
             |> Result.try
 
@@ -245,6 +268,7 @@ parseOutputObjectFieldRow = \schema, name, fields, row ->
             objectField = {
                 name: fieldName,
                 description: "",
+                parameters: [],
                 type: dataType,
             }
 
@@ -255,7 +279,8 @@ parseOutputObjectFieldRow = \schema, name, fields, row ->
         else
             Err X
 
-parseEnumVariantRow = \schema, name, variants, row ->
+parseEnumVariantRow : _ -> Result (PartialSchema, ParseSchemaAction) ParseEnumError
+parseEnumVariantRow = \{ schema, name, variants, row } ->
     if row |> Str.startsWith "}" then
         enum = { name, variants }
         Ok (
@@ -263,26 +288,26 @@ parseEnumVariantRow = \schema, name, variants, row ->
             SearchForEntity,
         )
     else
-        (variantName, afterVariantName) <- parseScreamingSnakeCaseWord row
+        (variantName, afterVariantName) <- parseScreamingSnakeCaseWord (Str.toUtf8 row)
             |> Result.mapErr InvalidEnumVariantName
             |> Result.try
 
-        remainingText = Str.trim afterVariantName
-        if Str.isEmpty remainingText then
+        remainingText = dropCharsWhile afterVariantName isWhitespace
+        if List.isEmpty remainingText then
             Ok (schema, ParseEnum name (List.append variants variantName))
         else
-            Err (UnexpectedSuffix remainingText)
+            Err (UnexpectedSuffix (fromUtf8Unchecked remainingText))
 
 parseUnion : Str -> Result SchemaUnion ParseUnionError
 parseUnion = \row ->
     parseRemainingMembers = \restOfText ->
-        trimmedRest = Str.trimStart restOfText
-        if Str.isEmpty trimmedRest then
+        trimmedRest = dropCharsWhile restOfText isWhitespace
+        if List.isEmpty trimmedRest then
             Ok []
         else
-            when Str.splitFirst trimmedRest "|" is
-                Ok { before: "", after } ->
-                    trimmedAfter = Str.trimStart after
+            when List.splitFirst trimmedRest '|' is
+                Ok { before: [], after } ->
+                    trimmedAfter = dropCharsWhile after isWhitespace
                     (memberName, afterMemberName) <- parseUpperCamelCaseWord trimmedAfter
                         |> Result.mapErr InvalidMemberName
                         |> Result.try
@@ -291,19 +316,19 @@ parseUnion = \row ->
 
                     Ok (List.concat [memberName] restOfMembers)
 
-                _otherwise -> Err (UnexpectedSuffix trimmedRest)
+                _otherwise -> Err (UnexpectedSuffix (fromUtf8Unchecked trimmedRest))
 
     trimmedRow = Str.trimStart row
-    (unionName, afterUnionName) <- parseUpperCamelCaseWord trimmedRow
+    (unionName, afterUnionName) <- parseUpperCamelCaseWord (Str.toUtf8 trimmedRow)
         |> Result.mapErr InvalidName
         |> Result.try
-    afterNameTrimmed = Str.trimStart afterUnionName
+    afterNameTrimmed = dropCharsWhile afterUnionName isWhitespace
 
     afterEqualsSign <- afterNameTrimmed
-        |> removePrefix "="
-        |> Result.mapErr \PrefixNotPresent -> NameNotFollowedByEqualsSign
+        |> parseByte '='
+        |> Result.mapErr \ByteNotFound -> NameNotFollowedByEqualsSign
         |> Result.try
-    afterEqualsTrimmed = Str.trimStart afterEqualsSign
+    afterEqualsTrimmed = dropCharsWhile afterEqualsSign isWhitespace
 
     (firstMember, afterFirstMember) <- parseUpperCamelCaseWord afterEqualsTrimmed
         |> Result.mapErr InvalidName
@@ -322,6 +347,21 @@ parseDataType = \chars ->
         when chars is
             ['I', 'D', .. as rest] -> Ok (ID, rest)
             ['S', 't', 'r', 'i', 'n', 'g', .. as rest] -> Ok (String, rest)
+            ['I', 'n', 't', .. as rest] -> Ok (Int, rest)
+            ['F', 'l', 'o', 'a', 't', .. as rest] -> Ok (Float, rest)
+            ['B', 'o', 'o', 'l', 'e', 'a', 'n', .. as rest] -> Ok (Float, rest)
+            ['[', .. as rest] ->
+                (innerType, afterInner) <- parseDataType rest
+                    |> Result.try
+                when afterInner is
+                    [']', .. as afterList] -> Ok (List innerType, afterList)
+                    _ -> Err InvalidList
+
+            _ ->
+                (name, afterName) <- parseUpperCamelCaseWord chars
+                    |> Result.try
+
+                Ok (Object name, afterName)
 
     (type, leftover) <- parseResult
         |> Result.try
@@ -329,4 +369,3 @@ parseDataType = \chars ->
     when leftover is
         ['!', .. as afterLeftover] -> Ok (NotNull type, afterLeftover)
         _ -> Ok (Nullable type, leftover)
-

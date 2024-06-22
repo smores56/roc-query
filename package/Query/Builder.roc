@@ -7,12 +7,12 @@ module [
     objectWithRenamedParams,
 ]
 
-import json.Json
+# import json.Json
 import Query.Base exposing [
     buildQueryStr,
     QueryField,
     QueryObjectField,
-    QuerySelector,
+    # QuerySelector,
     GraphQLParseError,
     QuerySelectorField,
 ]
@@ -32,21 +32,43 @@ start = \parser ->
         parser: \_data -> Ok parser,
     }
 
-finish : QuerySelectorBuilder decodeData decodeData params encodeParams, Str -> QuerySelector decodeData params where decodeData implements Decoding, encodeParams implements Encoding
+# finish : QuerySelectorBuilder decodeData decodeData params encodeParams, Str -> QuerySelector decodeData params where decodeData implements Decoding, encodeParams implements Encoding
+# finish = \@QuerySelectorBuilder { fields, paramSelector, parser }, queryName ->
+#     newParser = \jsonBytes ->
+#         decodedData : Result { data : decodeData } GraphQLParseError
+#         decodedData =
+#             Decode.fromBytes jsonBytes Json.utf8
+#             |> Result.mapErr FailedToDecodeJson
+
+#         decodedData
+#         |> Result.try \{ data } -> parser data
+
+#     encodeParams = \paramsData ->
+#         paramsData
+#         |> paramSelector
+#         |> Encode.toBytes Json.utf8
+
+#     {
+#         queryStr: buildQueryStr { fields, queryName },
+#         encodeParams,
+#         parser: newParser,
+#     }
+
+finish : QuerySelectorBuilder decodeData decodeData params encodeParams, Str -> _ where decodeData implements Decoding, encodeParams implements Encoding
 finish = \@QuerySelectorBuilder { fields, paramSelector, parser }, queryName ->
-    newParser = \jsonBytes ->
+    newParser = \jsonBytes, fmt ->
         decodedData : Result { data : decodeData } GraphQLParseError
         decodedData =
-            Decode.fromBytes jsonBytes Json.utf8
+            Decode.fromBytes jsonBytes fmt
             |> Result.mapErr FailedToDecodeJson
 
         decodedData
         |> Result.try \{ data } -> parser data
 
-    encodeParams = \paramsData ->
+    encodeParams = \paramsData, fmt ->
         paramsData
         |> paramSelector
-        |> Encode.toBytes Json.utf8
+        |> Encode.toBytes fmt
 
     {
         queryStr: buildQueryStr { fields, queryName },
