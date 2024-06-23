@@ -57,7 +57,7 @@ parseLowerCamelCaseWord = \chars ->
                                 Break (Err FirstLetterMustBeLowerCase)
 
                         GetLetter ->
-                            if isLowerCaseLetter char || isUpperCaseLetter char then
+                            if isLowerCaseLetter char || isUpperCaseLetter char || isDigit char then
                                 Continue (Ok (GetLetter, charCount + 1))
                             else
                                 Break (Ok (GetLetter, charCount))
@@ -95,7 +95,7 @@ parseUpperCamelCaseWord = \chars ->
                                 Break (Err FirstLetterMustBeUpperCase)
 
                         GetLetter ->
-                            if isLowerCaseLetter char || isUpperCaseLetter char then
+                            if isLowerCaseLetter char || isUpperCaseLetter char || isDigit char then
                                 Continue (Ok (GetLetter, charCount + 1))
                             else
                                 Break (Ok (GetLetter, charCount))
@@ -133,7 +133,7 @@ parseScreamingSnakeCaseWord = \chars ->
                                 Break (Err FirstLetterMustBeUpperCase)
 
                         GetLetterOrUnderscore ->
-                            if isUpperCaseLetter char then
+                            if isUpperCaseLetter char || isDigit char then
                                 Continue (Ok (GetLetterOrUnderscore, charCount + 1))
                             else if isUnderscore char then
                                 Continue (Ok (GetLetter, charCount + 1))
@@ -141,7 +141,7 @@ parseScreamingSnakeCaseWord = \chars ->
                                 Break (Ok (GetLetterOrUnderscore, charCount))
 
                         GetLetter ->
-                            if isUpperCaseLetter char then
+                            if isUpperCaseLetter char || isDigit char then
                                 Continue (Ok (GetLetterOrUnderscore, charCount + 1))
                             else if isUnderscore char then
                                 Break (Err DoubleUnderscoreNotAllowed)

@@ -16,9 +16,20 @@ import weaver.Param
 import weaver.Subcommand
 import rq.Codegen
 import rq.Parse
-import rq.Query as QB
-import json.Json
-# import Client
+import rq.Query
+import Client
+
+dataQuery =
+    Client.buildQuery "DataQuery" \{ query, book } ->
+        Query.start {
+            books: <-
+                Query.start {
+                    author: <- Query.field book.author,
+                }
+                |> Query.object query.books,
+        }
+
+queryParams = {}
 
 main =
     args = Arg.list!
@@ -59,18 +70,15 @@ generateGraphQLModule = \{ path, modulePath } ->
     File.writeUtf8! modulePath moduleCode
 
 fetchDataFromApi =
-    apiUrl = "" # TODO
-    query =
-        QB.start {}
-        |> QB.finish "DataQuery"
-    requestBody = query.encodeParams {} Json.utf8
+    apiUrl = "http://localhost:8000"
+    requestBody = dataQuery.encodeParams queryParams
     request = { Http.defaultRequest & body: requestBody, url: apiUrl }
     response =
         Http.send request
             |> Task.mapErr! \HttpError err -> SomeErr (Http.errorToString err)
     data =
         response.body
-            |> query.parser Json.utf8
+            |> dataQuery.parser
             |> Result.mapErr \err -> SomeErr (Inspect.toStr err)
             |> Task.fromResult!
     Stdout.line! "Got data back from API:"

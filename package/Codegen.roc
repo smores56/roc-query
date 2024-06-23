@@ -54,29 +54,40 @@ getNameOfObjectFromType = \nullableDataType ->
 
 generateModule : { schema : Schema } -> Str
 generateModule = \{ schema } ->
-    [renderModuleHeader schema]
-    |> List.concat (List.map schema.queryRoot.fields renderQueryRootFieldBlock)
+    [renderModuleHeader schema] # |> List.concat (List.map schema.queryRoot.fields renderQueryRootFieldBlock)
+    |> List.append (renderBuildQueryFunction schema)
     |> List.concat (List.map schema.outputObjects renderOutputObjectBlock)
     |> List.intersperse [""]
     |> List.join
     |> List.append ""
     |> Str.joinWith "\n"
 
-renderModuleHeader : Schema -> List Str
-renderModuleHeader = \schema ->
-    exportLines =
-        schema.queryRoot.fields
-        |> List.map \field ->
-            "    $(queryRootFieldName field),"
-
-    ["module ["]
-    |> List.concat exportLines
-    |> List.concat [
-        "]",
-        "",
-        "import json.Option exposing [Option]",
-        "import rq.Query.Base exposing [QueryField, QueryObjectField]",
+renderBuildQueryFunction : Schema -> List Str
+renderBuildQueryFunction = \schema ->
+    [
+        "buildQuery : Str, (_ -> Query.QuerySelectorBuilder decodeData decodeData params encodeParams { query : {} }) -> Query.QuerySelector decodeData params where decodeData implements Decoding, encodeParams implements Encoding",
+        "buildQuery = \\queryName, selectorBuilder ->",
+        "    selectorBuilder {",
     ]
+    |> List.concat
+        (
+            schema.outputObjects
+            |> List.map \obj ->
+                "        $(decapitalize obj.name): $(objectFieldName obj.name) {},"
+        )
+    |> List.concat [
+        "    }",
+        "    |> Query.finish queryName",
+    ]
+
+renderModuleHeader : Schema -> List Str
+renderModuleHeader = \_schema -> [
+    "module [buildQuery]",
+    "",
+    "import json.Option exposing [Option]",
+    "import rq.Query",
+    "import rq.Utils",
+]
 
 renderParamsBlock : List SchemaFieldParameter -> List Str
 renderParamsBlock = \params ->
@@ -108,63 +119,86 @@ renderParamsType = \params ->
             |> List.map \{ name, type } -> "$(name) : $(renderNullableRocType type)"
             |> Str.joinWith ", "
 
-        "{ $(paramTypes) }a"
-
-queryRootFieldName : SchemaObjectField -> Str
-queryRootFieldName = \{ name } -> "query$(capitalize name)"
+        "{ $(paramTypes) }*"
 
 objectFieldName : Str -> Str
 objectFieldName = \objectName ->
     "$(decapitalize objectName)Object"
 
-renderFieldTypeDefinition : SchemaObjectField -> Str
-renderFieldTypeDefinition = \field ->
+renderFieldTypeDefinition : { field : SchemaObjectField, parentObjectName : Str, index : U64 } -> Str
+renderFieldTypeDefinition = \{ field, parentObjectName, index } ->
+    paramsType = field.parameters |> renderParamsType
+
+    renderCompositeDataType = \type, nameOfObject ->
+        when type is
+            Option inner -> "(Option $(renderCompositeDataType inner nameOfObject))"
+            List inner -> "(List $(renderCompositeDataType inner nameOfObject))"
+            Single -> nameOfObject
+
     when getNameOfObjectFromType field.type is
-        Ok _objectName ->
-            paramsType = field.parameters |> renderParamsType
-            "{} -> QueryObjectField _ _ _ $(paramsType)"
+        Ok objectName ->
+            childDataType = "childData$(Num.toStr index)"
+            compositeType = renderCompositeDataType (getParserApplicatorNullableType field.type) childDataType
+
+            "Query.QueryObjectField { $(field.name) : $(compositeType) }* ($(compositeType)) $(childDataType) _ $(paramsType) { $(objectFieldName objectName): {} }"
 
         Err NotAnObject ->
             rocTypeName = renderNullableRocType field.type
-            "{} -> QueryField _ $(rocTypeName) _"
+            "Query.QueryField { $(field.name) : $(rocTypeName) }* $(rocTypeName) $(paramsType) { $(parentObjectName): {} }"
 
-renderFieldBlock : { field : SchemaObjectField, level : [Root, Child] } -> List Str
-renderFieldBlock = \{ field, level } ->
-    fieldDefinitionLines =
-        when level is
-            Child -> ["$(field.name): \\{} -> {"]
-            Root ->
-                objectName = queryRootFieldName field
-                [
-                    "$(objectName) : $(renderFieldTypeDefinition field)",
-                    "$(objectName) = \\{} -> {",
-                ]
+getParserApplicatorNullableType = \type ->
+    when type is
+        Nullable innerType -> Option (getParserApplicatorType innerType)
+        NotNull innerType -> getParserApplicatorType innerType
 
-    objectFieldsBlock =
+getParserApplicatorType = \type ->
+    when type is
+        List listType -> List (getParserApplicatorNullableType listType)
+        ID | String | Int | Float | Boolean | Object _name | CustomScalar _name -> Single
+
+getParserApplicatorFunctionName : NullableDataType -> Str
+getParserApplicatorFunctionName = \fieldType ->
+    when getParserApplicatorNullableType fieldType is
+        Single -> "Utils.trySingle"
+        List Single -> "Utils.tryList"
+        Option Single -> "Utils.tryOption"
+        List (Option Single) -> "Utils.tryListOfOptions"
+        Option (List Single) -> "Utils.tryOptionList"
+        List (List Single) -> "Utils.tryListList"
+        # TODO: handle this more visibly to the user
+        _ -> "Utils.trySingle"
+
+renderOutputObjectFieldBlock : SchemaObjectField -> List Str
+renderOutputObjectFieldBlock = \field ->
+    (fieldDefinitionLine, objectFieldsBlock) =
         when getNameOfObjectFromType field.type is
-            Ok objectName -> ["    fields: $(objectFieldName objectName),"]
-            Err NotAnObject -> []
+            Ok objectName ->
+                applicatorFunctionName = getParserApplicatorFunctionName field.type
+                (
+                    "    $(field.name): Query.newObjectField {",
+                    [
+                        "        applyParserToItems: $(applicatorFunctionName),",
+                        "        fields: $(objectFieldName objectName) {},",
+                    ],
+                )
+
+            Err NotAnObject ->
+                (
+                    "    $(field.name): Query.newField {",
+                    [],
+                )
 
     paramsBlock =
         renderParamsBlock field.parameters
         |> List.map \line ->
-            indentTimes line 1
+            indentTimes line 2
 
-    fieldDefinitionLines
-    |> List.append "    name: \"$(field |> .name)\","
+    [fieldDefinitionLine]
+    |> List.append "        name: \"$(field.name)\","
     |> List.concat paramsBlock
-    |> List.append "    resolver: \\{ $(field |> .name) } -> Ok $(field |> .name),"
+    |> List.append "        resolver: \\{ $(field.name) } -> Ok $(field.name),"
     |> List.concat objectFieldsBlock
-    |> List.append "}$(if level == Root then "" else ",")"
-    |> List.map \line ->
-        indentAmount = if level == Child then 1 else 0
-        indentTimes line indentAmount
-
-renderQueryRootFieldBlock : SchemaObjectField -> List Str
-renderQueryRootFieldBlock = \field -> renderFieldBlock { field, level: Root }
-
-renderOutputObjectFieldBlock : SchemaObjectField -> List Str
-renderOutputObjectFieldBlock = \field -> renderFieldBlock { field, level: Child }
+    |> List.append "    },"
 
 renderOutputObjectBlock : SchemaOutputObject -> List Str
 renderOutputObjectBlock = \{ name, fields } ->
@@ -177,7 +211,9 @@ renderOutputObjectBlock = \{ name, fields } ->
         |> List.concat
             (
                 fields
-                |> List.map \field -> "$(field.name) : $(renderFieldTypeDefinition field),"
+                |> List.mapWithIndex \field, index ->
+                    fieldTypeDefinition = renderFieldTypeDefinition { field, parentObjectName: objectName, index }
+                    "$(field.name) : $(fieldTypeDefinition),"
                 |> List.map \line -> indentTimes line 2
             )
         |> List.concat [
@@ -190,21 +226,21 @@ renderOutputObjectBlock = \{ name, fields } ->
     |> List.append ["}"]
     |> List.join
 
-capitalize = \text ->
-    chars = Str.toUtf8 text
-    firstChar =
-        List.first chars
-        |> Result.withDefault 0
+# capitalize = \text ->
+#     chars = Str.toUtf8 text
+#     firstChar =
+#         List.first chars
+#         |> Result.withDefault 0
 
-    updatedChars =
-        if firstChar >= 'a' && firstChar <= 'z' then
-            capitalizeDiff = 'a' - 'A'
-            chars |> List.set 0 (firstChar - capitalizeDiff)
-        else
-            chars
+#     updatedChars =
+#         if firstChar >= 'a' && firstChar <= 'z' then
+#             capitalizeDiff = 'a' - 'A'
+#             chars |> List.set 0 (firstChar - capitalizeDiff)
+#         else
+#             chars
 
-    Str.fromUtf8 updatedChars
-    |> Result.withDefault ""
+#     Str.fromUtf8 updatedChars
+#     |> Result.withDefault ""
 
 decapitalize = \text ->
     chars = Str.toUtf8 text
